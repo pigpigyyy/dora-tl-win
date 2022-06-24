@@ -1,0 +1,36 @@
+name: MSBuild
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v1.0.2
+
+    - name: Build
+      run: |
+        msbuild /m /p:Configuration=release /p:Platform=x86 tl.sln
+        msbuild /m /p:Configuration=release /p:Platform=x64 tl.sln
+
+    - name: pack
+      run: |
+        (cd Release && 7z a ..\tl-windows-x86.7z tl.exe && cd ..)
+        (cd x64\Release && 7z a ..\..\tl-windows-x64.7z tl.exe && cd ..\..)
+
+    - name: release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          tl-windows-x86.7z
+          tl-windows-x64.7z
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
