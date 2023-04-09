@@ -1209,6 +1209,7 @@ local table_types <const> = {
 
 
 
+
 local Fact = {}
 
 
@@ -1242,6 +1243,7 @@ local attributes <const> = {
    ["total"] = true,
 }
 local is_attribute <const> = attributes
+
 
 
 
@@ -1439,6 +1441,17 @@ local function new_type(ps, i, typename)
       x = token.x,
       tk = token.tk,
    })
+end
+
+
+local function shallow_copy_type(t)
+   local copy = {}
+   for k, v in pairs(t) do
+      copy[k] = v
+   end
+   local typ = copy
+   typ.typeid = new_typeid()
+   return typ
 end
 
 local function verify_kind(ps, i, kind, node_kind)
@@ -1692,6 +1705,9 @@ local function parse_function_type(ps, i)
       i, typ.typeargs = parse_anglebracket_list(ps, i, parse_typearg)
    end
    if ps.tokens[i].tk == "(" then
+      if ps.tokens[i + 1].tk == "self" then
+         typ.is_method_hint = true
+      end
       i, typ.args = parse_argument_type_list(ps, i)
       i, typ.rets = parse_return_types(ps, i)
    else
@@ -2444,6 +2460,8 @@ local function parse_function(ps, i, ft)
    i = parse_function_args_rets_body(ps, i, fn)
    if fn.is_method then
       table.insert(fn.args, 1, { x = selfx, y = selfy, tk = "self", kind = "identifier" })
+   elseif fn.args[1] and fn.args[1].tk == "self" then
+      fn.is_method_hint = false
    end
 
    if not fn.name then
@@ -2830,6 +2848,7 @@ parse_record_body = function(ps, i, def, node)
                if not metamethod_names[field_name] then
                   fail(ps, i - 1, "not a valid metamethod: " .. field_name)
                end
+               t.is_method_hint = nil
             end
             if is_const then
                if not def.readonlys then
@@ -5527,12 +5546,12 @@ local function init_globals(lax)
          fields = {
             ["char"] = a_type({ typename = "function", args = VARARG({ NUMBER }), rets = TUPLE({ STRING }) }),
             ["charpattern"] = STRING,
-            ["codepoint"] = a_type({ typename = "function", args = TUPLE({ STRING, OPT_NUMBER, OPT_NUMBER }), rets = VARARG({ INTEGER }) }),
-            ["codes"] = a_type({ typename = "function", args = TUPLE({ STRING }), rets = TUPLE({
+            ["codepoint"] = a_type({ typename = "function", args = TUPLE({ STRING, OPT_NUMBER, OPT_NUMBER, OPT_BOOLEAN }), rets = VARARG({ INTEGER }) }),
+            ["codes"] = a_type({ typename = "function", args = TUPLE({ STRING, OPT_BOOLEAN }), rets = TUPLE({
                a_type({ typename = "function", args = TUPLE({}), rets = TUPLE({ NUMBER, STRING }) }),
             }), }),
-            ["len"] = a_type({ typename = "function", args = TUPLE({ STRING, NUMBER, NUMBER }), rets = TUPLE({ INTEGER }) }),
-            ["offset"] = a_type({ typename = "function", args = TUPLE({ STRING, NUMBER, NUMBER }), rets = TUPLE({ INTEGER }) }),
+            ["len"] = a_type({ typename = "function", args = TUPLE({ STRING, OPT_NUMBER, OPT_NUMBER, OPT_BOOLEAN }), rets = TUPLE({ INTEGER }) }),
+            ["offset"] = a_type({ typename = "function", args = TUPLE({ STRING, NUMBER, OPT_NUMBER }), rets = TUPLE({ INTEGER }) }),
          },
       }),
       ["_VERSION"] = STRING,
@@ -5995,6 +6014,7 @@ tl.type_check = function(ast, opts)
             end
 
             copy.is_method = t.is_method
+            copy.is_method_hint = t.is_method_hint
             copy.min_arity = t.min_arity
             copy.args, same = resolve(t.args, same)
             copy.rets, same = resolve(t.rets, same)
@@ -7710,8 +7730,15 @@ tl.type_check = function(ast, opts)
             for i = 1, n do
                if (not tried) or not tried[i] then
                   local f = is_func and func or func.types[i]
-                  if f.is_method and not is_method and not (args[1] and is_a(args[1], f.args[1])) then
-                     return node_error(where, "invoked method as a regular function: use ':' instead of '.'")
+                  if (f.is_method or f.is_method_hint) and not is_method then
+                     if args[1] and is_a(args[1], f.args[1]) then
+                        local receiver_is_typetype = where.e1.e1 and where.e1.e1.type and where.e1.e1.type.resolved and where.e1.e1.type.resolved.typename == "typetype"
+                        if not receiver_is_typetype then
+                           node_warning("hint", where, "invoked method as a regular function: consider using ':' instead of '.'")
+                        end
+                     else
+                        return node_error(where, "invoked method as a regular function: use ':' instead of '.'")
+                     end
                   end
                   local expected = #f.args
                   local min_arity = f.min_arity or set_min_arity(f)
@@ -9002,6 +9029,10 @@ tl.type_check = function(ast, opts)
             node_error(node.vars[i], "cannot infer declaration type; an explicit type annotation is necessary")
             ok = false
             infertype = INVALID
+         elseif infertype and infertype.is_method then
+
+            infertype = shallow_copy_type(infertype)
+            infertype.is_method = false
          end
       end
 
@@ -9072,7 +9103,9 @@ tl.type_check = function(ast, opts)
       local is_total = true
       local missing
       for _, key in ipairs(t.field_order) do
-         is_total, missing = total_check_key(key, seen_keys, is_total, missing)
+         if not is_typetype(t.fields[key]) then
+            is_total, missing = total_check_key(key, seen_keys, is_total, missing)
+         end
       end
       return is_total, missing
    end
@@ -9470,6 +9503,9 @@ tl.type_check = function(ast, opts)
             widen_all_unions(node)
             begin_scope(node)
             local from_t = resolve_tuple_and_nominal(children[2])
+            if from_t.typename ~= "integer" and from_t.typename ~= "number" then
+               node_error(node.from, "bad 'for' initial value (number expected, got %s)", from_t)
+            end
             local to_t = resolve_tuple_and_nominal(children[3])
             local step_t = children[4] and resolve_tuple_and_nominal(children[4])
             local t = (from_t.typename == "integer" and
@@ -9708,6 +9744,11 @@ tl.type_check = function(ast, opts)
                vtype = node.decltype
                assert_is_a(node.value, children[2], node.decltype, "in table item")
             end
+            if vtype.is_method then
+
+               vtype = shallow_copy_type(vtype)
+               vtype.is_method = false
+            end
             node.type = a_type({
                y = node.y,
                x = node.x,
@@ -9822,6 +9863,7 @@ tl.type_check = function(ast, opts)
                x = node.x,
                typename = "function",
                is_method = node.is_method,
+               is_method_hint = node.is_method_hint,
                typeargs = node.typeargs,
                args = children[3],
                rets = get_rets(children[4]),
