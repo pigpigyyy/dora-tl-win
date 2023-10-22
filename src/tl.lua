@@ -136,6 +136,7 @@ local tl = {TypeCheckOptions = {}, Env = {}, Symbol = {}, Result = {}, Error = {
 
 
 
+
 tl.version = function()
 	return VERSION
 end
@@ -1379,8 +1380,11 @@ local parse_argument_list
 local parse_argument_type_list
 local parse_type
 local parse_newtype
+
+
 local parse_enum_body
 local parse_record_body
+local parse_type_body_fns
 
 local function fail(ps, i, msg)
 	if not ps.tokens[i] then
@@ -1479,26 +1483,23 @@ local function failskip(ps, i, msg, skip_fn, starti)
 	return skip_i
 end
 
-local function skip_record(ps, i)
+local function skip_type_body(ps, i)
+	local tn = ps.tokens[i].tk
 	i = i + 1
-	return parse_record_body(ps, i, {}, { kind = "function" })
-end
-
-local function skip_enum(ps, i)
-	i = i + 1
-	return parse_enum_body(ps, i, {}, {})
+	assert(parse_type_body_fns[tn], tn .. " has no parse body function")
+	return parse_type_body_fns[tn](ps, i, {}, { kind = "function" })
 end
 
 local function parse_table_value(ps, i)
 	local next_word = ps.tokens[i].tk
 	if next_word == "record" then
-		local skip_i, e = skip(ps, i, skip_record)
+		local skip_i, e = skip(ps, i, skip_type_body)
 		if e then
 			fail(ps, i, "syntax error: this syntax is no longer valid; declare nested record inside a record")
 			return skip_i, new_node(ps.tokens, i, "error_node")
 		end
 	elseif next_word == "enum" and ps.tokens[i + 1].kind == "string" then
-		i = failskip(ps, i, "syntax error: this syntax is no longer valid; declare nested enum inside a record", skip_enum)
+		i = failskip(ps, i, "syntax error: this syntax is no longer valid; declare nested enum inside a record", skip_type_body)
 		return i, new_node(ps.tokens, i - 1, "error_node")
 	end
 
@@ -2408,10 +2409,9 @@ local function parse_argument_type(ps, i)
 			is_va = true
 		end
 		typ.opt = opt
-	end
-
-	if argument_name == "self" then
-		typ.is_self = true
+		if argument_name == "self" then
+			typ.is_self = true
+		end
 	end
 
 	return i, { i = i, type = typ, is_va = is_va }, 0
@@ -2696,8 +2696,6 @@ local function store_field_in_record(ps, i, field_name, t, fields, field_order)
 	return true
 end
 
-
-
 local function parse_nested_type(ps, i, def, typename, parse_body)
 	i = i + 1
 	local iv = i
@@ -2773,6 +2771,7 @@ parse_record_body = function(ps, i, def, node, name)
 		i, def.typeargs = parse_anglebracket_list(ps, i, parse_typearg)
 	end
 	while not (ps.tokens[i].kind == "$EOF$" or ps.tokens[i].tk == "end") do
+		local tn = ps.tokens[i].tk
 		if ps.tokens[i].tk == "userdata" and ps.tokens[i + 1].tk ~= ":" then
 			if def.is_userdata then
 				fail(ps, i, "duplicated 'userdata' declaration in record")
@@ -2811,10 +2810,8 @@ parse_record_body = function(ps, i, def, node, name)
 			end
 
 			store_field_in_record(ps, iv, v.tk, nt.newtype, def.fields, def.field_order)
-		elseif ps.tokens[i].tk == "record" and ps.tokens[i + 1].tk ~= ":" then
-			i = parse_nested_type(ps, i, def, "record", parse_record_body)
-		elseif ps.tokens[i].tk == "enum" and ps.tokens[i + 1].tk ~= ":" then
-			i = parse_nested_type(ps, i, def, "enum", parse_enum_body)
+		elseif parse_type_body_fns[tn] and ps.tokens[i + 1].tk ~= ":" then
+			i = parse_nested_type(ps, i, def, tn, parse_type_body_fns[tn])
 		elseif ps.tokens[i].tk == "embed" and ps.tokens[i + 1].tk ~= ":" then
 			local t
 			i, t = parse_type(ps, i + 1)
@@ -2918,19 +2915,19 @@ parse_record_body = function(ps, i, def, node, name)
 	return i, node
 end
 
+parse_type_body_fns = {
+	["record"] = parse_record_body,
+	["enum"] = parse_enum_body,
+}
+
 parse_newtype = function(ps, i, name)
 	local node = new_node(ps.tokens, i, "newtype")
 	node.newtype = new_type(ps, i, "typetype")
-	if ps.tokens[i].tk == "record" then
-		local def = new_type(ps, i, "record")
+	local tn = ps.tokens[i].tk
+	if parse_type_body_fns[tn] then
+		local def = new_type(ps, i, tn)
 		i = i + 1
-		i = parse_record_body(ps, i, def, node, name)
-		node.newtype.def = def
-		return i, node
-	elseif ps.tokens[i].tk == "enum" then
-		local def = new_type(ps, i, "enum")
-		i = i + 1
-		i = parse_enum_body(ps, i, def, node)
+		i = parse_type_body_fns[tn](ps, i, def, node, name)
 		node.newtype.def = def
 		return i, node
 	else
@@ -3029,13 +3026,10 @@ local function parse_variable_declarations(ps, i, node_name)
 	if ps.tokens[i].tk == "=" then
 
 		local next_word = ps.tokens[i + 1].tk
-		if next_word == "record" then
+		local tn = next_word
+		if parse_type_body_fns[tn] then
 			local scope = node_name == "local_declaration" and "local" or "global"
-
-			return failskip(ps, i + 1, "syntax error: this syntax is no longer valid; use '" .. scope .. " record " .. asgn.vars[1].tk .. "'", skip_record)
-		elseif next_word == "enum" then
-			local scope = node_name == "local_declaration" and "local" or "global"
-			return failskip(ps, i + 1, "syntax error: this syntax is no longer valid; use '" .. scope .. " enum " .. asgn.vars[1].tk .. "'", skip_enum)
+			return failskip(ps, i + 1, "syntax error: this syntax is no longer valid; use '" .. scope .. " " .. next_word .. " " .. asgn.vars[1].tk .. "'", skip_type_body)
 		elseif next_word == "functiontype" then
 			local scope = node_name == "local_declaration" and "local" or "global"
 			return failskip(ps, i + 1, "syntax error: this syntax is no longer valid; use '" .. scope .. " type " .. asgn.vars[1].tk .. " = function('...", parse_function_type)
@@ -3107,28 +3101,26 @@ end
 
 local function parse_local(ps, i)
 	local ntk = ps.tokens[i + 1].tk
+	local tn = ntk
 	if ntk == "function" then
 		return parse_local_function(ps, i)
 	elseif ntk == "type" and ps.tokens[i + 2].kind == "identifier" then
 		return parse_type_declaration(ps, i, "local_type")
-	elseif ntk == "record" and ps.tokens[i + 2].kind == "identifier" then
-		return parse_type_constructor(ps, i, "local_type", "record", parse_record_body)
-	elseif ntk == "enum" and ps.tokens[i + 2].kind == "identifier" then
-		return parse_type_constructor(ps, i, "local_type", "enum", parse_enum_body)
+	elseif parse_type_body_fns[tn] and ps.tokens[i + 2].kind == "identifier" then
+		return parse_type_constructor(ps, i, "local_type", tn, parse_type_body_fns[tn])
 	end
 	return parse_variable_declarations(ps, i + 1, "local_declaration")
 end
 
 local function parse_global(ps, i)
 	local ntk = ps.tokens[i + 1].tk
+	local tn = ntk
 	if ntk == "function" then
 		return parse_function(ps, i + 1, "global")
 	elseif ntk == "type" and ps.tokens[i + 2].kind == "identifier" then
 		return parse_type_declaration(ps, i, "global_type")
-	elseif ntk == "record" and ps.tokens[i + 2].kind == "identifier" then
-		return parse_type_constructor(ps, i, "global_type", "record", parse_record_body)
-	elseif ntk == "enum" and ps.tokens[i + 2].kind == "identifier" then
-		return parse_type_constructor(ps, i, "global_type", "enum", parse_enum_body)
+	elseif parse_type_body_fns[tn] and ps.tokens[i + 2].kind == "identifier" then
+		return parse_type_constructor(ps, i, "global_type", tn, parse_type_body_fns[tn])
 	elseif ps.tokens[i + 1].kind == "identifier" then
 		return parse_variable_declarations(ps, i + 1, "global_declaration")
 	end
@@ -3154,16 +3146,17 @@ local parse_statement_fns = {
 	["function"] = parse_record_function,
 }
 
+local function type_needs_local_or_global(ps, i)
+	local tk = ps.tokens[i].tk
+	return failskip(ps, i, ("%s needs to be declared with 'local %s' or 'global %s'"):format(tk, tk, tk), skip_type_body)
+end
+
 local needs_local_or_global = {
 	["type"] = function(ps, i)
 		return failskip(ps, i, "types need to be declared with 'local type' or 'global type'", skip_type_declaration)
 	end,
-	["record"] = function(ps, i)
-		return failskip(ps, i, "records need to be declared with 'local record' or 'global record'", skip_record)
-	end,
-	["enum"] = function(ps, i)
-		return failskip(ps, i, "enums need to be declared with 'local enum' or 'global enum'", skip_enum)
-	end,
+	["record"] = type_needs_local_or_global,
+	["enum"] = type_needs_local_or_global,
 }
 
 parse_statements = function(ps, i, toplevel)
@@ -4647,6 +4640,38 @@ local function show_type_base(t, short, seen)
 		return show_type(typ, short, seen)
 	end
 
+	local function show_record_type(name)
+		if short then
+			return name
+		else
+			local out = { name }
+			if t.typeargs then
+				table.insert(out, "<")
+				local typeargs = {}
+				for _, v in ipairs(t.typeargs) do
+					table.insert(typeargs, show(v))
+				end
+				table.insert(out, table.concat(typeargs, ", "))
+				table.insert(out, ">")
+			end
+			table.insert(out, " (")
+			if t.is_userdata then
+				table.insert(out, "(userdata)")
+			end
+			if t.elements then
+				table.insert(out, "{" .. show(t.elements) .. "}")
+			end
+			local fs = {}
+			for _, k in ipairs(t.field_order) do
+				local v = t.fields[k]
+				table.insert(fs, k .. ": " .. show(v))
+			end
+			table.insert(out, table.concat(fs, "; "))
+			table.insert(out, ")")
+			return table.concat(out)
+		end
+	end
+
 	if t.typename == "nominal" then
 		if t.typevals then
 			local out = { table.concat(t.names, "."), "<" }
@@ -4693,42 +4718,7 @@ local function show_type_base(t, short, seen)
 	elseif t.typename == "enum" then
 		return t.names and table.concat(t.names, ".") or "enum"
 	elseif is_record_type(t) then
-		if short then
-			return "record"
-		else
-			local out = { "record" }
-			if t.typeargs then
-				table.insert(out, "<")
-				local typeargs = {}
-				for _, v in ipairs(t.typeargs) do
-					table.insert(typeargs, show(v))
-				end
-				table.insert(out, table.concat(typeargs, ", "))
-				table.insert(out, ">")
-			end
-			table.insert(out, " (")
-			if t.is_userdata then
-				table.insert(out, "(userdata)")
-			end
-			if t.elements then
-				table.insert(out, "{" .. show(t.elements) .. "}")
-			end
-			if t.embeds then
-				local es = {}
-				for _, k in ipairs(t.embeds) do
-					table.insert(es, show(k))
-				end
-				table.insert(out, "(embed " .. table.concat(es, ", ") .. ")")
-			end
-			local fs = {}
-			for _, k in ipairs(t.field_order) do
-				local v = t.fields[k]
-				table.insert(fs, k .. ": " .. show(v))
-			end
-			table.insert(out, table.concat(fs, "; "))
-			table.insert(out, ")")
-			return table.concat(out)
-		end
+		return show_record_type("record")
 	elseif t.typename == "function" then
 		local out = { "function" }
 		if t.typeargs then
@@ -5242,7 +5232,7 @@ local function init_globals(lax)
 				typename = "record",
 				is_userdata = true,
 				fields = {
-					["close"] = a_type({ typename = "function", args = TUPLE({ NOMINAL_FILE }), rets = TUPLE({ BOOLEAN, STRING }) }),
+					["close"] = a_type({ typename = "function", args = TUPLE({ NOMINAL_FILE }), rets = TUPLE({ BOOLEAN, STRING, INTEGER }) }),
 					["flush"] = a_type({ typename = "function", args = TUPLE({ NOMINAL_FILE }), rets = TUPLE({}) }),
 					["lines"] = a_type({ typename = "function", args = VARARG({ NOMINAL_FILE, a_type({ opt = true, typename = "union", types = { STRING, NUMBER } }) }), rets = TUPLE({
 						a_type({ typename = "function", args = TUPLE({}), rets = VARARG({ STRING }) }),
@@ -5250,7 +5240,7 @@ local function init_globals(lax)
 					["read"] = a_type({ typename = "function", args = TUPLE({ NOMINAL_FILE, OPT_UNION({ STRING, NUMBER }) }), rets = TUPLE({ STRING, STRING }) }),
 					["seek"] = a_type({ typename = "function", args = TUPLE({ NOMINAL_FILE, OPT_STRING, OPT_NUMBER }), rets = TUPLE({ INTEGER, STRING }) }),
 					["setvbuf"] = a_type({ typename = "function", args = TUPLE({ NOMINAL_FILE, STRING, OPT_NUMBER }), rets = TUPLE({}) }),
-					["write"] = a_type({ typename = "function", args = VARARG({ NOMINAL_FILE, STRING }), rets = TUPLE({ NOMINAL_FILE, STRING }) }),
+					["write"] = a_type({ typename = "function", args = VARARG({ NOMINAL_FILE, UNION({ STRING, NUMBER }) }), rets = TUPLE({ NOMINAL_FILE, STRING }) }),
 
 				},
 				meta_fields = { ["__close"] = FUNCTION },
@@ -5393,7 +5383,7 @@ local function init_globals(lax)
 				["stdout"] = NOMINAL_FILE,
 				["tmpfile"] = a_type({ typename = "function", args = TUPLE({}), rets = TUPLE({ NOMINAL_FILE }) }),
 				["type"] = a_type({ typename = "function", args = TUPLE({ ANY }), rets = TUPLE({ STRING }) }),
-				["write"] = a_type({ typename = "function", args = VARARG({ STRING }), rets = TUPLE({ NOMINAL_FILE, STRING }) }),
+				["write"] = a_type({ typename = "function", args = VARARG({ UNION({ STRING, NUMBER }) }), rets = TUPLE({ NOMINAL_FILE, STRING }) }),
 			},
 		}),
 		["math"] = a_type({
@@ -5511,14 +5501,14 @@ local function init_globals(lax)
 				}),
 				["loaders"] = a_type({
 					typename = "array",
-					elements = a_type({ typename = "function", args = TUPLE({ STRING }), rets = TUPLE({ ANY }) }),
+					elements = a_type({ typename = "function", args = TUPLE({ STRING }), rets = TUPLE({ ANY, ANY }) }),
 				}),
 				["loadlib"] = a_type({ typename = "function", args = TUPLE({ STRING, STRING }), rets = TUPLE({ FUNCTION }) }),
 				["path"] = STRING,
 				["preload"] = TABLE,
 				["searchers"] = a_type({
 					typename = "array",
-					elements = a_type({ typename = "function", args = TUPLE({ STRING }), rets = TUPLE({ ANY }) }),
+					elements = a_type({ typename = "function", args = TUPLE({ STRING }), rets = TUPLE({ ANY, ANY }) }),
 				}),
 				["searchpath"] = a_type({ typename = "function", args = TUPLE({ STRING, STRING, OPT_STRING, OPT_STRING }), rets = TUPLE({ STRING, STRING }) }),
 			},
@@ -5595,7 +5585,7 @@ local function init_globals(lax)
 				["charpattern"] = STRING,
 				["codepoint"] = a_type({ typename = "function", args = TUPLE({ STRING, OPT_NUMBER, OPT_NUMBER, OPT_BOOLEAN }), rets = VARARG({ INTEGER }) }),
 				["codes"] = a_type({ typename = "function", args = TUPLE({ STRING, OPT_BOOLEAN }), rets = TUPLE({
-					a_type({ typename = "function", args = TUPLE({}), rets = TUPLE({ NUMBER, NUMBER }) }),
+					a_type({ typename = "function", args = TUPLE({ STRING, OPT_NUMBER }), rets = TUPLE({ NUMBER, NUMBER }) }),
 				}), }),
 				["len"] = a_type({ typename = "function", args = TUPLE({ STRING, OPT_NUMBER, OPT_NUMBER, OPT_BOOLEAN }), rets = TUPLE({ INTEGER }) }),
 				["offset"] = a_type({ typename = "function", args = TUPLE({ STRING, NUMBER, OPT_NUMBER }), rets = TUPLE({ INTEGER }) }),
@@ -5898,6 +5888,10 @@ tl.type_check = function(ast, opts)
 	end
 
 	local function is_valid_union(typ)
+		if typ.typename ~= "union" then
+			return false, nil
+		end
+
 
 
 		local n_table_types = 0
@@ -6269,6 +6263,9 @@ tl.type_check = function(ast, opts)
 
 	local function infer_at(where, t)
 		local ret = resolve_typevars_at(where, t)
+		if ret.typename == "invalid" then
+			ret = t
+		end
 		ret = (ret ~= t) and ret or shallow_copy_type(t)
 		ret.inferred_at = where
 		ret.inferred_at_file = filename
@@ -7659,13 +7656,10 @@ tl.type_check = function(ast, opts)
 
 			check_args_rets = function(where, where_args, f, args, rets, argdelta)
 				local rets_ok = true
-				local rets_errs
 				local args_ok
 				local args_errs
 
-				local from = 1
 				if argdelta == -1 then
-					from = 2
 					local errs = {}
 					if not arg_check(where, is_a, args[1], f.args[1], nil, errs, "self") then
 						return nil, errs
@@ -7676,7 +7670,7 @@ tl.type_check = function(ast, opts)
 					rets = infer_at(where, rets)
 					infer_emptytables(where, nil, rets, f.rets, 0)
 
-					rets_ok, rets_errs = check_func_type_list(where, nil, f.rets, rets, 1, 0, "return")
+					rets_ok = check_func_type_list(where, nil, f.rets, rets, 1, 0, "return")
 				end
 
 				args_ok, args_errs = check_func_type_list(where, where_args, args, f.args, 1, argdelta, "argument")
@@ -7839,7 +7833,7 @@ tl.type_check = function(ast, opts)
 		end
 	end
 
-	local function check_metamethod(node, op, a, b)
+	local function check_metamethod(node, op, a, b, orig_a, orig_b)
 		local method_name
 		local where_args
 		local args
@@ -7847,11 +7841,11 @@ tl.type_check = function(ast, opts)
 		if a and b then
 			method_name = binop_to_metamethod[op]
 			where_args = { node.e1, node.e2 }
-			args = { typename = "tuple", a, b }
+			args = { typename = "tuple", orig_a, orig_b }
 		else
 			method_name = unop_to_metamethod[op]
 			where_args = { node.e1 }
-			args = { typename = "tuple", a }
+			args = { typename = "tuple", orig_a }
 		end
 
 		local metamethod = a.meta_fields and a.meta_fields[method_name or ""]
@@ -7892,7 +7886,7 @@ tl.type_check = function(ast, opts)
 				return tbl.fields[key]
 			end
 
-			local mt_type = check_metamethod(rec, "@index", tbl, STRING)
+			local mt_type = check_metamethod(rec, "@index", tbl, STRING, tbl, STRING)
 			if mt_type then
 				return mt_type
 			end
@@ -8130,7 +8124,7 @@ tl.type_check = function(ast, opts)
 
 	local function get_assignment_values(vals, wanted)
 		local ret = {}
-		if vals == nil then
+		if vals == nil or #vals == 0 then
 			return ret
 		end
 
@@ -8263,7 +8257,7 @@ tl.type_check = function(ast, opts)
 			errm, erra, errb = "cannot index object of type %s with %s", orig_a, orig_b
 		end
 
-		local meta_t = check_metamethod(anode, "@index", a, orig_b)
+		local meta_t = check_metamethod(anode, "@index", a, orig_b, orig_a, orig_b)
 		if meta_t then
 			return meta_t
 		end
@@ -8465,7 +8459,7 @@ tl.type_check = function(ast, opts)
 				elseif is_a(t2, t1) then
 					return t2
 				else
-					return INVALID
+					return NIL
 				end
 			end
 		end
@@ -8506,7 +8500,7 @@ tl.type_check = function(ast, opts)
 			end
 
 			if #types == 0 then
-				return INVALID
+				return NIL
 			end
 
 			return unite(types)
@@ -8630,7 +8624,8 @@ tl.type_check = function(ast, opts)
 				end
 				if typ.typename ~= "typevar" then
 					if is_a(typ, f.typ) then
-						node_warning("branch", f.where, f.var .. " (of type %s) is always a %s", show_type(typ), show_type(f.typ))
+
+
 						return { [f.var] = f }
 					elseif not is_a(f.typ, typ) then
 						node_error(f.where, f.var .. " (of type %s) can never be a %s", typ, f.typ)
@@ -9607,7 +9602,7 @@ tl.type_check = function(ast, opts)
 				end
 
 				if #children[1] > nrets and (not lax) and not vatype then
-					node_error(node, "in " .. what .. ": excess return values, expected " .. #rets .. " %s, got " .. #children[1] .. " %s", rets, children[1])
+					node_error(node, what .. ": excess return values, expected " .. #rets .. " %s, got " .. #children[1] .. " %s", rets, children[1])
 				end
 
 				if nrets > 1 and
@@ -10103,29 +10098,30 @@ tl.type_check = function(ast, opts)
 					end
 					node.type = type_check_funcall(node, a, b, 0)
 				elseif node.op.op == "." then
-					assert(node.e2.kind == "identifier")
-					local bnode = {
-						y = node.e2.y,
-						x = node.e2.x,
-						tk = node.e2.tk,
-						kind = "string",
-						conststr = node.e2.tk,
-					}
-					local btype = a_type({
-						y = node.e2.y,
-						x = node.e2.x,
-						tk = '"' .. node.e2.tk .. '"',
-						typename = "string",
-					})
-					node.type = type_check_index(node.e1, bnode, orig_a, btype)
+					if node.e2.kind == "identifier" then
+						local bnode = {
+							y = node.e2.y,
+							x = node.e2.x,
+							tk = node.e2.tk,
+							kind = "string",
+							conststr = node.e2.tk,
+						}
+						local btype = a_type({
+							y = node.e2.y,
+							x = node.e2.x,
+							tk = '"' .. node.e2.tk .. '"',
+							typename = "string",
+						})
+						node.type = type_check_index(node.e1, bnode, orig_a, btype)
 
-					if node.type.needs_compat and opts.gen_compat ~= "off" then
+						if node.type.needs_compat and opts.gen_compat ~= "off" then
 
-						if node.e1.kind == "variable" and node.e2.kind == "identifier" then
-							local key = node.e1.tk .. "." .. node.e2.tk
-							node.kind = "variable"
-							node.tk = "_tl_" .. node.e1.tk .. "_" .. node.e2.tk
-							all_needs_compat[key] = true
+							if node.e1.kind == "variable" and node.e2.kind == "identifier" then
+								local key = node.e1.tk .. "." .. node.e2.tk
+								node.kind = "variable"
+								node.tk = "_tl_" .. node.e1.tk .. "_" .. node.e2.tk
+								all_needs_compat[key] = true
+							end
 						end
 					end
 				elseif node.op.op == "@index" then
@@ -10189,7 +10185,7 @@ tl.type_check = function(ast, opts)
 						local a_is = is_a(a, node.expected)
 						local b_is = is_a(b, node.expected)
 						if a_is and b_is then
-							node.type = node.expected
+							node.type = resolve_typevars_at(node, node.expected)
 						elseif a_is then
 							node.type = resolve_tuple(b)
 						else
@@ -10224,7 +10220,7 @@ tl.type_check = function(ast, opts)
 					node.type = types_op[a.typename]
 					local meta_on_operator
 					if not node.type then
-						node.type, meta_on_operator = check_metamethod(node, node.op.op, a)
+						node.type, meta_on_operator = check_metamethod(node, node.op.op, a, nil, orig_a, nil)
 						if not node.type then
 							node_error(node, "cannot use operator '" .. node.op.op:gsub("%%", "%%%%") .. "' on type %s", resolve_tuple(orig_a))
 						end
@@ -10270,9 +10266,12 @@ tl.type_check = function(ast, opts)
 					node.type = types_op[a.typename] and types_op[a.typename][b.typename]
 					local meta_on_operator
 					if not node.type then
-						node.type, meta_on_operator = check_metamethod(node, node.op.op, a, b)
+						node.type, meta_on_operator = check_metamethod(node, node.op.op, a, b, orig_a, orig_b)
 						if not node.type then
 							node_error(node, "cannot use operator '" .. node.op.op:gsub("%%", "%%%%") .. "' for types %s and %s", resolve_tuple(orig_a), resolve_tuple(orig_b))
+							if node.op.op == "or" and is_valid_union(unite({ orig_a, orig_b })) then
+								node_warning("hint", node, "if a union type was intended, consider declaring it explicitly")
+							end
 						end
 					end
 
@@ -10766,6 +10765,14 @@ function tl.get_types(result, trenv)
 				r[k] = get_typenum(v)
 			end
 			ti.fields = r
+			if rt.meta_fields then
+				local mr = {}
+				for _, k in ipairs(rt.meta_field_order) do
+					local v = rt.meta_fields[k]
+					mr[k] = get_typenum(v)
+				end
+				ti.meta_fields = mr
+			end
 		end
 
 		if is_array_type(rt) then
@@ -11063,11 +11070,14 @@ local function tl_package_loader(module_name)
 		local code = assert(tl.pretty_print_ast(program, env.gen_target, true))
 		local chunk, err = load(code, "@" .. found_filename, "t")
 		if chunk then
-			return function()
-				local ret = chunk()
+			return function(modname, loader_data)
+				if loader_data == nil then
+					loader_data = found_filename
+				end
+				local ret = chunk(modname, loader_data)
 				package.loaded[module_name] = ret
 				return ret
-			end
+			end, found_filename
 		else
 			error("Internal Compiler Error: Teal generator produced invalid Lua. Please report a bug at https://github.com/teal-language/tl\n\n" .. err)
 		end
