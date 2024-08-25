@@ -143,6 +143,7 @@ local tl = {PrettyPrintOptions = {}, TypeCheckOptions = {}, Env = {}, Symbol = {
 
 
 
+
 tl.version = function()
 	return VERSION
 end
@@ -609,7 +610,7 @@ do
 			if not i then
 				i = len + 1
 			end
-			end_token_here("hashbang")
+			end_token_prev("hashbang")
 			y = 2
 			x = 0
 		end
@@ -2718,7 +2719,7 @@ local function parse_nested_type(ps, i, def, typename, parse_body)
 	end
 
 	local nt = new_node(ps.tokens, i - 2, "newtype")
-	nt.newtype = new_type(ps, i, "typetype")
+	nt.newtype = new_type(ps, i - 1, "typetype")
 	local rdef = new_type(ps, i, typename)
 	local iok = parse_body(ps, i, rdef, nt, v.tk)
 	if iok then
@@ -3853,9 +3854,12 @@ function tl.pretty_print_ast(ast, gen_target, mode)
 	visit_node.cbs = {
 		["statements"] = {
 			after = function(node, children)
-				local out = { y = node.y, h = 0 }
+				local out
 				if opts.preserve_hashbang and node.hashbang then
+					out = { y = 1, h = 0 }
 					table.insert(out, node.hashbang)
+				else
+					out = { y = node.y, h = 0 }
 				end
 				local space
 				for i, child in ipairs(children) do
@@ -4843,8 +4847,8 @@ end
 local function filename_to_module_name(filename)
 	local path = os.getenv("TL_PATH") or package.path
 	for entry in path:gmatch("[^;]+") do
-		entry = entry:gsub("%.", "%%.")
-		local lua_pat = "^" .. entry:gsub("%?", ".+") .. "$"
+		local ent = entry:gsub("%.", "%%.")
+		local lua_pat = "^" .. ent:gsub("%?", ".+") .. "$"
 		local d_tl_pat = lua_pat:gsub("%%.lua%$", "%%.d%%.tl$")
 		local tl_pat = lua_pat:gsub("%%.lua%$", "%%.tl$")
 
@@ -5926,7 +5930,10 @@ tl.type_check = function(ast, opts)
 		end
 	end
 
+	local resolve_embeds
+
 	local function union_type(t)
+		resolve_embeds(t)
 		if is_typetype(t) then
 			return union_type(t.def)
 		elseif t.typename == "tuple" then
@@ -6725,9 +6732,9 @@ tl.type_check = function(ast, opts)
 		return false, t2.typename .. " can't be embedded"
 	end
 
-	local resolve_tuple_and_nominal = nil
+	local resolve_tuple_and_nominal
 
-	local function resolve_embeds(t)
+	resolve_embeds = function(t)
 		if not t.embeds or t.embeds_resolved then
 			return t
 		end
@@ -8118,7 +8125,7 @@ tl.type_check = function(ast, opts)
 	end
 
 	local function add_function_definition_for_recursion(node)
-		local args = a_type({ typename = "tuple" })
+		local args = a_type({ typename = "tuple", is_va = node.args.type.is_va })
 		for _, fnarg in ipairs(node.args) do
 			table.insert(args, fnarg.type)
 		end
@@ -9597,7 +9604,11 @@ tl.type_check = function(ast, opts)
 								r = lax and UNKNOWN or INVALID
 							end
 						end
-						add_var(v, v.tk, r)
+						if i == 1 then
+							add_var(v, v.tk, r, "const")
+						else
+							add_var(v, v.tk, r)
+						end
 						last = r
 					end
 					if (not lax) and (not rets.is_va and #node.vars > #rets) then
@@ -9629,7 +9640,7 @@ tl.type_check = function(ast, opts)
 				(not step_t or step_t.typename == "integer")) and
 				INTEGER or
 				NUMBER
-				add_var(node.var, node.var.tk, t)
+				add_var(node.var, node.var.tk, t, "const")
 			end,
 			after = end_scope_and_none_type,
 		},
@@ -10786,6 +10797,7 @@ function tl.get_types(result, trenv)
 			table.insert(args, mark_array({ get_typenum(fnarg), nil }))
 		end
 		ti.args = mark_array(args)
+		ti.is_method = rt.is_method
 		local rets = {}
 		for _, fnarg in ipairs(rt.rets) do
 			table.insert(rets, mark_array({ get_typenum(fnarg), nil }))
